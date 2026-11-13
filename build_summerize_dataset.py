@@ -5,6 +5,9 @@ from collections import Counter
 import json
 import os
 import re
+import torch
+from unsloth import FastLanguageModel
+from tqdm import tqdm
 
 
 # =======================================================
@@ -446,6 +449,179 @@ def analyze_batches_jsonl(file_path):
     print(f"\n{line}\nAnalysis finished.\n{line}")
 
 
+# =======================================================
+# 4- load model & tokenizer
+# =======================================================
+def load_model_for_inference(model_name, max_seq_length=4096):
+    """
+    Loads model using Unsloth for fast inference (generating summaries).
+    """
+    print(f"Loading model with Unsloth for Inference: {model_name}")
+
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_name,
+        max_seq_length=max_seq_length,  # Increased to 4096 to handle long inputs
+        dtype=torch.bfloat16,
+        load_in_4bit=True,
+        local_files_only=True,
+    )
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    FastLanguageModel.for_inference(model)
+
+    print("✅ Model loaded with Unsloth for Inference!")
+    return model, tokenizer
+
+
+# =======================================================
+# 5- Prompt Engineering & Generation
+# =======================================================
+def generate_summaries(model, tokenizer, test_mode=False, batch_size=6):
+    """
+    Generate Persian summaries using Batch Inference for maximum GPU utilization.
+    """
+    INPUT_FILE = "data/processed_datasets/batches_for_summarization.jsonl"
+
+    OUTPUT_FILE = (
+        "data/processed_datasets/synthetic_summary_test.jsonl"
+        if test_mode
+        else "data/processed_datasets/synthetic_summary_dataset.jsonl"
+    )
+
+    SYSTEM_PROMPT = """تو یک متخصص تحلیل و خلاصه‌سازی نظرات مشتریان هستی.
+
+مجموعه‌ای از نظرات کاربران درباره یک محصول به تو داده می‌شود. هر نظر با تگ‌هایی مانند <<< نظر 1 >>> از سایر نظرات جدا شده است. این تگ‌ها صرفاً برای جداسازی هستند و نباید در خروجی ظاهر شوند.
+
+وظیفه تو تولید یک خلاصه یکپارچه، روان و بی‌طرفانه از مجموع نظرات است.
+
+در خلاصه خود:
+1. مهم‌ترین نقاط قوت و مزایای محصول را بیان کن.
+2. مهم‌ترین نقاط ضعف و مشکلات گزارش‌شده را مشخص کن.
+3. به موضوعات پرتکرار توجه بیشتری داشته باش، اما مشکلات مهم و قابل‌توجه را حتی اگر فقط در یک نظر مطرح شده‌اند نادیده نگیر. در عین حال، میزان فراگیری هر مشکل را به‌درستی منعکس کن و از تعمیم تجربه شخصی یک کاربر به کل محصول خودداری کن. مشکلات ناشی از استفاده نادرست، حوادث شخصی یا آسیب‌هایی که کاربر خود به محصول وارد کرده است، نباید به‌عنوان ضعف ذاتی محصول معرفی شوند.
+4. در تشخیص نقاط قوت و ضعف، قطبیت هر ویژگی را با دقت حفظ کن. یک ویژگی مثبت را به‌عنوان عیب یا یک ویژگی منفی را به‌عنوان مزیت معرفی نکن.
+5. صرف اشاره به یک ویژگی، مشخصات یا واقعیت درباره محصول، به معنای رضایت یا نارضایتی کاربر از آن نیست. فقط زمانی موضوعی را به‌عنوان نقطه قوت یا ضعف مطرح کن که از متن نظر، رضایت یا نارضایتی کاربر نسبت به آن قابل برداشت باشد.
+6. از ارائه درصد، نسبت یا آمار عددی درباره میزان رضایت کاربران خودداری کن، مگر اینکه این مقادیر به‌صورت صریح در نظرات ذکر شده باشند. تعداد یا نسبت کاربران را از روی نظرات به‌صورت تخمینی محاسبه یا اعلام نکن.
+7. در صورت وجود اختلاف نظر میان کاربران، آن را حفظ کن.
+8. حس کلی کاربران نسبت به محصول را بر اساس مجموع نظرات بیان کن.
+
+فقط از اطلاعات موجود در نظرات استفاده کن و هیچ اطلاعاتی از دانش قبلی خود اضافه نکن. همچنین از تکرار مطالب و نقل‌قول مستقیم (کپی کردن عین جملات) از کاربران خودداری کن.
+
+خروجی باید به زبان فارسی روان و رسمی، در حداکثر 4 تا 5 جمله باشد و فقط شامل متن خلاصه شود؛ بدون عنوان، مقدمه یا توضیحات اضافی."""
+
+    # 1. Load already processed batch IDs
+    processed_ids = set()
+    if os.path.exists(OUTPUT_FILE):
+        with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    data = json.loads(line)
+                    processed_ids.add(data["batch_id"])
+                except (json.JSONDecodeError, KeyError):
+                    print("Warning: Invalid record found in output file.")
+        print(f"Found {len(processed_ids)} processed batches. Resuming...")
+
+    # 2. Load input batches
+    with open(INPUT_FILE, "r", encoding="utf-8") as f:
+        all_batches = [json.loads(line) for line in f if line.strip()]
+
+    # 3. Filter unprocessed batches
+    batches_to_process = [
+        batch for batch in all_batches if batch["batch_id"] not in processed_ids
+    ]
+
+    if test_mode:
+        batches_to_process = batches_to_process[:5]
+        print("TEST MODE: Processing up to 5 batches.")
+
+    if not batches_to_process:
+        print("All batches have been processed already!")
+        return
+
+    print(
+        f"Starting inference on {len(batches_to_process)} batches with batch_size={batch_size}..."
+    )
+
+    # 4. Model and Tokenizer configuration for Batch Inference
+    model.eval()
+
+    # CRITICAL: Decoder-only models (like Gemma) MUST use left padding for batched generation
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # 5. Process in Chunks
+    with open(OUTPUT_FILE, "a", encoding="utf-8") as f_out:
+
+        # Iterate over the data in steps of batch_size
+        for i in tqdm(
+            range(0, len(batches_to_process), batch_size), desc="Generating Summaries"
+        ):
+            chunk = batches_to_process[i : i + batch_size]
+
+            prompts = []
+            for batch in chunk:
+                user_content = (
+                    f"{SYSTEM_PROMPT}\n\nنظرات کاربران:\n{batch['formatted_text']}\n"
+                )
+                messages = [{"role": "user", "content": user_content}]
+                prompt = tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                prompts.append(prompt)
+
+            # Tokenize the whole batch at once (with padding)
+            inputs = tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=1536,  # Prevent VRAM overflow
+            ).to(model.device)
+
+            # Generate for the whole batch
+            with torch.inference_mode():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=256,
+                    do_sample=True,
+                    temperature=0.3,
+                    top_p=0.9,
+                    use_cache=True,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+
+            # Decode the whole batch
+            generated_texts = tokenizer.batch_decode(
+                outputs[:, inputs.input_ids.shape[1] :],
+                skip_special_tokens=True,
+            )
+
+            # Save results
+            for batch, generated_text in zip(chunk, generated_texts):
+                generated_text = generated_text.strip()
+                if not generated_text:
+                    print(f"Warning: Empty summary for batch {batch['batch_id']}")
+                    continue
+
+                result_record = {
+                    "batch_id": batch["batch_id"],
+                    "product_id": batch["product_id"],
+                    "num_comments": batch["num_comments"],
+                    "input_text": batch["formatted_text"],
+                    "summary": generated_text,
+                }
+                f_out.write(json.dumps(result_record, ensure_ascii=False) + "\n")
+
+            # Flush after each chunk to save memory and prevent data loss
+            f_out.flush()
+
+    print("=" * 60)
+    print(f"Inference completed! Results saved to {OUTPUT_FILE}")
+    print("=" * 60)
+
+
 if __name__ == "__main__":
     DATASET_PATH = "data/raw_datasets/digikala_comments.csv"
     CLEAN_DATASET = "data/processed_datasets/digikala_comments_cleaned_min20_max1000.csv"
@@ -459,4 +635,8 @@ if __name__ == "__main__":
     # analyze_reviews_csv(CLEAN_DATASET)
 
     smart_batch_reviews(CLEAN_DATASET)
-    analyze_batches_jsonl("data/processed_datasets/batches_for_summarization.jsonl")
+    # analyze_batches_jsonl("data/processed_datasets/batches_for_summarization.jsonl")
+
+    base_model, base_tokenizer = load_model_for_inference(MODEL_NAME)
+
+    generate_summaries(base_model, base_tokenizer)
